@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ticket Triage · Multi-Agent Support</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="brand"><span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" class="icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+    </span>Ticket Triage</span>
+    <span id="mode" class="mode-chip">Checking…</span>
+  </div>
+</header>
+
+<main class="container">
+  <div class="page-head">
+    <h1>Multi-agent ticket triage</h1>
+    <p class="muted">Four agents classify intent, priority and sentiment, then route the ticket, draft a first response and decide whether a human must step in.</p>
+  </div>
+
+  <div class="layout">
+    <section class="card" aria-labelledby="new-h">
+      <h2 id="new-h">New ticket</h2>
+      <form id="ticket-form" novalidate>
+        <div class="field">
+          <label for="customer">Customer <span class="muted">(optional)</span></label>
+          <input id="customer" name="customer" maxlength="100" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="ticket">Ticket text</label>
+          <textarea id="ticket" name="ticket" rows="6" maxlength="5000" required aria-describedby="ticket-error"></textarea>
+          <span id="ticket-error" class="error" role="alert"></span>
+        </div>
+        <div class="samples">
+          <span class="muted small">Try a sample:</span>
+          {% for s in samples %}<button type="button" class="chip" data-sample="{{ s }}">{{ s[:28] }}…</button>{% endfor %}
+        </div>
+        <button class="btn btn-primary full" type="submit" id="submit">Triage ticket</button>
+      </form>
+    </section>
+
+    <section class="card result" aria-labelledby="result-h" aria-live="polite">
+      <h2 id="result-h">Result</h2>
+      <div id="result" class="placeholder">
+        <p class="muted">Submit a ticket to see each agent's decision.</p>
+      </div>
+    </section>
+  </div>
+
+  <section class="stats" id="stats" aria-label="Queue summary"></section>
+
+  <section class="card table-card" aria-labelledby="queue-h">
+    <div class="card-head">
+      <h2 id="queue-h">Ticket queue</h2>
+      <div class="tabs" role="tablist" aria-label="Filter tickets">
+        <button role="tab" aria-selected="true" data-filter="">All</button>
+        <button role="tab" aria-selected="false" data-filter="true">Needs human</button>
+        <button role="tab" aria-selected="false" data-filter="false">Auto-responded</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th scope="col">#</th><th scope="col">Ticket</th><th scope="col">Intent</th><th scope="col">Priority</th><th scope="col">Sentiment</th><th scope="col">Team</th><th scope="col">Status</th></tr></thead>
+        <tbody id="queue"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pct = c => Math.round(c * 100) + "%";
+let filter = "";
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || res.statusText);
+  return body;
+}
+
+function agentRow(name, r) {
+  const low = r.confidence < 0.6;
+  return `<div class="agent">
+    <span class="agent-name">${name}</span>
+    <span class="badge badge-${esc(r.label).toLowerCase().replace(/\s+/g, "-")}">${esc(r.label)}</span>
+    <span class="conf ${low ? "low" : ""}" title="Confidence">${pct(r.confidence)}${low ? " · low" : ""}</span>
+    <span class="src">${r.source === "llm" ? "LLM" : "Rules"}</span>
+    ${r.evidence?.length ? `<span class="evidence">${r.evidence.map(e => `“${esc(e)}”`).join(", ")}</span>` : ""}
+  </div>`;
+}
+
+function renderResult(t) {
+  const r = t.routing;
+  $("#result").className = "";
+  $("#result").innerHTML = `
+    <div class="status ${r.escalate ? "status-human" : "status-auto"}">
+      <strong>${r.escalate ? "Escalated to a human" : "Auto-responded"}</strong>
+      <span>${esc(r.team)} · reply within ${r.sla_hours} h</span>
+    </div>
+    ${r.escalate ? `<p class="reasons">Why: ${r.escalation_reasons.map(esc).join("; ")}</p>` : ""}
+    <div class="agents">
+      ${agentRow("Intent", t.intent)}${agentRow("Priority", t.priority)}${agentRow("Sentiment", t.sentiment)}
+    </div>
+    <h3>Next action</h3><p>${esc(r.next_action)}</p>
+    <h3>${r.auto_response_sent ? "First response (sent)" : "Holding response (sent)"}</h3>
+    <blockquote>${esc(r.first_response)}</blockquote>
+    <p class="muted small">Ticket #${t.id} · ${t.duration_ms} ms · mode: ${esc(t.mode)}</p>`;
+}
+
+async function loadQueue() {
+  const q = filter ? `?escalated=${filter}` : "";
+  const [list, stats] = await Promise.all([api("/api/tickets" + q), api("/api/stats")]);
+  $("#queue").innerHTML = list.items.map(t => `
+    <tr data-id="${t.id}" tabindex="0">
+      <td>${t.id}</td>
+      <td class="ticket-cell">${t.customer ? `<strong>${esc(t.customer)}</strong> ` : ""}${esc(t.ticket)}</td>
+      <td>${esc(t.intent.label)}</td>
+      <td><span class="badge badge-${t.priority.label.toLowerCase()}">${t.priority.label}</span></td>
+      <td>${esc(t.sentiment.label)}</td>
+      <td>${esc(t.routing.team)}</td>
+      <td>${t.routing.escalate ? '<span class="pill pill-human">Needs human</span>' : '<span class="pill pill-auto">Auto</span>'}</td>
+    </tr>`).join("") || `<tr><td colspan="7" class="muted">No tickets.</td></tr>`;
+  $("#stats").innerHTML = `
+    <div class="card stat"><span class="stat-label">Tickets</span><span class="stat-value">${stats.total}</span></div>
+    <div class="card stat"><span class="stat-label">Needs human</span><span class="stat-value">${stats.escalated}</span></div>
+    <div class="card stat"><span class="stat-label">Auto-responded</span><span class="stat-value">${stats.auto_resolved}</span></div>
+    <div class="card stat"><span class="stat-label">Urgent + high</span><span class="stat-value">${(stats.by_priority.URGENT || 0) + (stats.by_priority.HIGH || 0)}</span></div>`;
+}
+
+$("#ticket-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = $("#ticket").value.trim();
+  $("#ticket-error").textContent = "";
+  if (!text) { $("#ticket-error").textContent = "Enter the ticket text."; $("#ticket").focus(); return; }
+  const btn = $("#submit"); btn.disabled = true; btn.textContent = "Triaging…";
+  try {
+    const t = await api("/api/tickets", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ticket: text, customer: $("#customer").value})});
+    renderResult(t); loadQueue();
+  } catch (err) {
+    $("#ticket-error").textContent = err.message;
+  } finally { btn.disabled = false; btn.textContent = "Triage ticket"; }
+});
+
+document.querySelectorAll("[data-sample]").forEach(b => b.addEventListener("click", () => {
+  $("#ticket").value = b.dataset.sample; $("#ticket").focus();
+}));
+document.querySelectorAll("[data-filter]").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("[data-filter]").forEach(x => x.setAttribute("aria-selected", x === b));
+  filter = b.dataset.filter; loadQueue();
+}));
+async function openRow(row) { renderResult(await api("/api/tickets/" + row.dataset.id)); $("#result-h").scrollIntoView({behavior: "smooth", block: "start"}); }
+$("#queue").addEventListener("click", e => { const row = e.target.closest("tr[data-id]"); if (row) openRow(row); });
+$("#queue").addEventListener("keydown", e => { const row = e.target.closest("tr[data-id]"); if (row && e.key === "Enter") openRow(row); });
+
+api("/api/health").then(h => { $("#mode").textContent = h.mode === "llm" ? `LLM mode · ${h.model}` : "Rule-based mode"; })
+  .catch(() => { $("#mode").textContent = "API unreachable"; });
+loadQueue();
+</script>
+</body>
+</html>
